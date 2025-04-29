@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Polygon Arbitrage Auto-Trader</title>
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+  <style>
+    body {
+      background-color: #0b0c2a;
+      color: #e0e0e0;
+      font-family: Arial, sans-serif;
+      padding: 20px;
+    }
+    h1 {
+      text-align: center;
+    }
+    button, input {
+      background-color: #00ff91;
+      color: #0b0c2a;
+      border: none;
+      padding: 10px;
+      margin: 5px;
+      border-radius: 8px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 20px;
+      background-color: #1e1f3a;
+    }
+    th, td {
+      border: 1px solid #333;
+      padding: 8px;
+      text-align: center;
+    }
+    th {
+      background-color: #2b2d5a;
+    }
+    #profit {
+      margin-top: 20px;
+      font-size: 24px;
+      text-align: center;
+      color: #00ff91;
+    }
+    .green { color: #00ff91; }
+    .red { color: #ff4c4c; }
+    #livePrices {
+      margin-top: 20px;
+      background-color: #1e1f3a;
+      padding: 20px;
+      border-radius: 10px;
+    }
+  </style>
+</head>
+<body>
+
+<h1>Polygon Arbitrage Auto-Trader</h1>
+
+<div style="text-align:center;">
+  <button onclick="connectWallet()">Connect Wallet</button><br>
+  Trade Size (WBTC): <input id="tradeAmountInput" type="number" value="0.0001" step="0.00001" onchange="updateTradeAmount()"><br>
+  <button onclick="toggleMode()">Mode: Profit Only ✅</button>
+</div>
+
+<div style="text-align:center; margin-top:10px;">
+  <button onclick="startTrading()" id="startBtn">Start Trading</button>
+  <button onclick="stopTrading()" id="stopBtn" disabled>Stop Trading</button>
+</div>
+
+<div id="walletInfo" style="text-align:center; margin-top:10px;">
+  Wallet: <span id="walletAddress">Not Connected</span><br>
+  WBTC Balance: <span id="wbtcBalance">-</span><br>
+  USDC Balance: <span id="usdcBalance">-</span>
+</div>
+
+<div id="profit">Accumulated P/L: $0.0000</div>
+
+<div id="livePrices">
+  <h2 style="text-align:center;">Live DEX Prices</h2>
+  <p>QuickSwap: <span id="quickPrice">-</span> WBTC per USDC</p>
+  <p>Uniswap: <span id="uniPrice">-</span> WBTC per USDC</p>
+</div>
+
+<table id="logTable">
+  <thead>
+    <tr>
+      <th>Time</th>
+      <th>Route</th>
+      <th>WBTC In</th>
+      <th>USDC Out</th>
+      <th>WBTC Back</th>
+      <th>Gross Profit</th>
+      <th>Net Profit</th>
+      <th>Mode</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<script>
+let provider, signer, walletAddress;
+let tradingInterval = null;
+let priceInterval = null;
+let profitOnly = true;
+let accumulatedProfit = 0;
+let currentTradeAmount = ethers.utils.parseUnits("0.0001", 8); // WBTC has 8 decimals
+
+const wbtcAddress = "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6";
+const usdcAddress = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+
+const routers = {
+  QuickSwap: "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff",
+  Uniswap: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
+};
+
+const routerAbi = [
+  "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)",
+  "function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)"
+];
+
+const erc20Abi = [
+  "function balanceOf(address) view returns (uint)",
+  "function approve(address, uint) external returns (bool)"
+];
+
+async function connectWallet() {
+  if (!window.ethereum) return alert("MetaMask not detected!");
+  provider = new ethers.providers.Web3Provider(window.ethereum);
+  await provider.send("eth_requestAccounts", []);
+  signer = provider.getSigner();
+  walletAddress = await signer.getAddress();
+  document.getElementById("walletAddress").innerText = walletAddress;
+  await approveTokens();
+  await getBalances();
+  startPriceUpdates();
+  // Note: Don't start trading automatically here; do it via Start button
+}
+
+async function approveTokens() {
+  const wbtc = new ethers.Contract(wbtcAddress, erc20Abi, signer);
+  for (let router of Object.values(routers)) {
+    await wbtc.approve(router, ethers.constants.MaxUint256);
+  }
+}
+
+async function getBalances() {
+  const wbtc = new ethers.Contract(wbtcAddress, erc20Abi, provider);
+  const usdc = new ethers.Contract(usdcAddress, erc20Abi, provider);
+  const wbtcBal = await wbtc.balanceOf(walletAddress);
+  const usdcBal = await usdc.balanceOf(walletAddress);
+  document.getElementById("wbtcBalance").innerText = (wbtcBal / 1e8).toFixed(6) + " WBTC";
+  document.getElementById("usdcBalance").innerText = (usdcBal / 1e6).toFixed(2) + " USDC";
+}
+
+async function simulateAndTrade() {
+  const dexNames = Object.keys(routers);
+  const contracts = dexNames.map(name => new ethers.Contract(routers[name], routerAbi, signer));
+
+  try {
+    const amountsOutQuick = await contracts[0].getAmountsOut(currentTradeAmount, [wbtcAddress, usdcAddress]);
+    const amountsOutUni = await contracts[1].getAmountsOut(currentTradeAmount, [wbtcAddress, usdcAddress]);
+
+    const outQuick = amountsOutQuick[1];
+    const outUni = amountsOutUni[1];
+
+    let buyFrom, sellTo, usdcOut, usdcBack;
+
+    if (outQuick.gt(outUni)) {
+      buyFrom = "Uniswap";
+      sellTo = "QuickSwap";
+      usdcOut = outUni;
+      usdcBack = await contracts[0].getAmountsOut(usdcOut, [usdcAddress, wbtcAddress]);
+    } else {
+      buyFrom = "QuickSwap";
+      sellTo = "Uniswap";
+      usdcOut = outQuick;
+      usdcBack = await contracts[1].getAmountsOut(usdcOut, [usdcAddress, wbtcAddress]);
+    }
+
+    const grossProfit = usdcBack[1].sub(currentTradeAmount);
+    const netProfit = grossProfit.sub(ethers.utils.parseUnits("0.00001", 8)); // simple gas est.
+
+    const shouldTrade = profitOnly ? netProfit.gt(0) : true;
+
+    if (shouldTrade) {
+      const routerIn = new ethers.Contract(routers[buyFrom], routerAbi, signer);
+      const routerOut = new ethers.Contract(routers[sellTo], routerAbi, signer);
+      const deadline = Math.floor(Date.now() / 1000) + 60;
+
+      await routerIn.swapExactTokensForTokens(
+        currentTradeAmount,
+        0,
+        [wbtcAddress, usdcAddress],
+        walletAddress,
+        deadline
+      );
+
+      const usdc = new ethers.Contract(usdcAddress, erc20Abi, signer);
+      const usdcBal = await usdc.balanceOf(walletAddress);
+
+      await routerOut.swapExactTokensForTokens(
+        usdcBal,
+        0,
+        [usdcAddress, wbtcAddress],
+        walletAddress,
+        deadline
+      );
+
+      accumulatedProfit += parseFloat(ethers.utils.formatUnits(netProfit, 8));
+      updateProfit();
+      await getBalances();
+      logTrade(buyFrom, sellTo, currentTradeAmount, usdcOut, usdcBack[1], grossProfit, netProfit, "Executed ✅");
+    } else {
+      logTrade(buyFrom, sellTo, currentTradeAmount, usdcOut, usdcBack[1], grossProfit, netProfit, "Skipped ❌");
+    }
+  } catch (e) {
+    console.error("Simulation/Trade error:", e);
+  }
+}
+
+function logTrade(from, to, wbtcIn, usdcOut, wbtcBack, gross, net, status) {
+  const row = document.getElementById("logTable").querySelector("tbody").insertRow();
+  const now = new Date().toLocaleTimeString();
+  row.innerHTML = `
+    <td>${now}</td>
+    <td>${from} ➔ ${to}</td>
+    <td>${ethers.utils.formatUnits(wbtcIn, 8)}</td>
+    <td>${ethers.utils.formatUnits(usdcOut, 6)}</td>
+    <td>${ethers.utils.formatUnits(wbtcBack, 8)}</td>
+    <td>${ethers.utils.formatUnits(gross, 8)}</td>
+    <td class="${net.gt(0) ? 'green' : 'red'}">${ethers.utils.formatUnits(net, 8)}</td>
+    <td>${profitOnly ? 'Profit Only' : 'Always Trade'}</td>
+    <td>${status}</td>
+  `;
+}
+
+function updateProfit() {
+  document.getElementById("profit").innerText = `Accumulated P/L: $${accumulatedProfit.toFixed(6)}`;
+}
+
+function updateTradeAmount() {
+  const input = parseFloat(document.getElementById("tradeAmountInput").value);
+  if (input < 0.00001) {
+    alert("Minimum is 0.00001 WBTC");
+    return;
+  }
+  currentTradeAmount = ethers.utils.parseUnits(input.toString(), 8);
+}
+
+// Start Trading button handler
+function startTrading() {
+  if (tradingInterval) clearInterval(tradingInterval);
+  tradingInterval = setInterval(simulateAndTrade, 15000);
+  document.getElementById("startBtn").disabled = true;
+  document.getElementById("stopBtn").disabled = false;
+}
+
+// Stop Trading button handler
+function stopTrading() {
+  if (tradingInterval) {
+    clearInterval(tradingInterval);
+    tradingInterval = null;
+  }
+  document.getElementById("startBtn").disabled = false;
+  document.getElementById("stopBtn").disabled = true;
+}
+
+function startPriceUpdates() {
+  if (priceInterval) clearInterval(priceInterval);
+  priceInterval = setInterval(updatePrices, 5000);
+}
+
+async function updatePrices() {
+  const routerQuick = new ethers.Contract(routers.QuickSwap, routerAbi, provider);
+  const routerUni = new ethers.Contract(routers.Uniswap, routerAbi, provider);
+
+  try {
+    const quick = await routerQuick.getAmountsOut(ethers.utils.parseUnits("1", 6), [usdcAddress, wbtcAddress]);
+    const uni = await routerUni.getAmountsOut(ethers.utils.parseUnits("1", 6), [usdcAddress, wbtcAddress]);
+
+    document.getElementById("quickPrice").innerText = (quick[1] / 1e8).toFixed(8);
+    document.getElementById("uniPrice").innerText = (uni[1] / 1e8).toFixed(8);
+  } catch (err) {
+    console.error("Price fetch error:", err);
+  }
+}
+
+function toggleMode() {
+  profitOnly = !profitOnly;
+  document.querySelector("button[onclick='toggleMode()']").innerText =
+    profitOnly ? "Mode: Profit Only ✅" : "Mode: Always Trade ⚡";
+}
+</script>
+
+</body>
+</html>
