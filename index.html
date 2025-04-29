@@ -243,8 +243,8 @@ function updateProfit() {
 
 function updateTradeAmount() {
   const input = parseFloat(document.getElementById("tradeAmountInput").value);
-  if (input < 0.00001) {
-    alert("Minimum is 0.00001 WBTC");
+  if (input < 0.00000001) {
+    alert("Minimum is 0.00000001 WBTC");
     return;
   }
   currentTradeAmount = ethers.utils.parseUnits(input.toString(), 8);
